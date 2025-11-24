@@ -1,21 +1,5 @@
 // This is the rclone build script. It can build rclone binaries for any target
 // architecture on any target architecture.
-//
-// Supported Android targets:
-//  - arm-v8a (64 bit arm)
-//  - arm-v7a (32 bit arm7)
-//  - x86 (32 bit)
-//  - x64 (64 bit)
-//
-// Supported host systems:
-//  - linux x64
-//  - macOS x64
-//  - macOS arm64 (Silicon)
-//  - windows x64
-//
-// Prerequisites:
-//  - go 1.20+
-//  - Either Android SDK command-line tools, or the expected NDK version (see gradle.properties).
 
 import groovy.json.JsonSlurper
 import java.nio.file.Paths
@@ -26,13 +10,14 @@ ext {
     RCLONE_VERSION = project.properties['de.felixnuesse.extract.rCloneVersion']
     GO_REQ_VERSION = project.properties['de.felixnuesse.extract.goVersion']
     
-    // FIXED: We must use the official module name because the source code inside 
-    // the Filen fork still claims to be "github.com/rclone/rclone".
+    // 1. Use the OFFICIAL module name so internal imports inside the code work.
     RCLONE_MODULE = 'github.com/rclone/rclone'     
     
-    // We define the fork URL separately to use in the 'replace' directive.
+    // 2. Define the Filen fork URL for the replacement.
     RCLONE_FORK_MODULE = 'github.com/FilenCloudDienste/filen-rclone'
-    RCLONE_CUSTOM_VERSION_SUFFIX = '-filen'
+    
+    // 3. Set suffix to empty because your gradle.properties version already has "-filen"
+    RCLONE_CUSTOM_VERSION_SUFFIX = '' 
 
     PROJECT_DIR = projectDir.absolutePath
     CACHE_PATH = Paths.get(PROJECT_DIR, 'cache').toString()
@@ -67,7 +52,6 @@ def findNdkDir() {
     def sdkDir = findSdkDir()
     def ndkPath = Paths.get(sdkDir, 'ndk', NDK_VERSION).toAbsolutePath()
     if (!ndkPath.toFile().exists()) {
-        // NDK not found. Let's try to install it.
         def sdkManagerPath = Paths.get(
             sdkDir,
             'cmdline-tools',
@@ -84,11 +68,8 @@ def findNdkDir() {
             }
         } catch (exc) {
             logger.error(exc.toString())
-            // NDK installation failed. Just raise an error.
             throw new GradleException(
-                "Couldn't find a ndk bundle in ${ndkPath.toString()}. Make sure that you have the"
-                + " proper version installed in Android Studio's SDK Manager or run"
-                + " \"${sdkManagerPath} --install 'ndk;${NDK_VERSION}'\"."
+                "Couldn't find a ndk bundle in ${ndkPath.toString()}."
             )
         }
     }
@@ -143,7 +124,10 @@ def buildRclone(abi) {
     return {
         doLast {
             exec {
+                // FIX: workingDir moved inside exec
+                workingDir CACHE_PATH
                 environment 'GOPATH', GOPATH
+                
                 def crossCompiler = getCrossCompiler(abi)
                 environment 'CC', crossCompiler
                 environment 'CC_FOR_TARGET', crossCompiler
@@ -151,10 +135,10 @@ def buildRclone(abi) {
                 environment 'CGO_ENABLED', '1'
                 environment 'CGO_LDFLAGS', '-fuse-ld=lld -Wl,--hash-style=both -s'
                 abiToEnv[abi].each {entry -> environment entry.key, entry.value}
-                workingDir CACHE_PATH
                 
-                // We use RCLONE_MODULE here (rclone/rclone) because that is what the source code expects.
-                def ldflags = "-buildid= -X ${RCLONE_MODULE}/fs.Version=${RCLONE_VERSION}${RCLONE_CUSTOM_VERSION_SUFFIX}"
+                // We use RCLONE_MODULE (rclone/rclone) here to match the source code
+                // We add 'v' to fs.Version to match standard rclone output style
+                def ldflags = "-buildid= -X ${RCLONE_MODULE}/fs.Version=v${RCLONE_VERSION}${RCLONE_CUSTOM_VERSION_SUFFIX}"
                 
                 commandLine (
                     'go',
@@ -174,7 +158,6 @@ def buildRclone(abi) {
 }
 
 task createRcloneModule(type: Exec) {
-    // We create a dummy go module to be able to checkout our specific rclone version later on.
     onlyIf { !Paths.get(CACHE_PATH, 'go.mod').toFile().exists() }
     Paths.get(CACHE_PATH).toFile().mkdirs()
     workingDir CACHE_PATH
@@ -182,16 +165,15 @@ task createRcloneModule(type: Exec) {
     commandLine 'go', 'mod', 'init', 'rclone'
 }
 
-// CHANGED: This task is no longer type: Exec, but a general task so we can run multiple commands.
 task checkoutRclone {
     dependsOn createRcloneModule
     
     doLast {
-        workingDir CACHE_PATH
-        
         // 1. Check Go Version
         def goVersionOutput = new ByteArrayOutputStream()
         exec {
+            // FIX: workingDir moved inside exec
+            workingDir CACHE_PATH
             environment 'GOPATH', GOPATH
             commandLine 'go', 'version'
             standardOutput = goVersionOutput
@@ -204,25 +186,27 @@ task checkoutRclone {
             logger.error("You are running: ${goVersionOutput}")
         }
         
-        println "Preparing to build rclone fork: ${RCLONE_FORK_MODULE} @ ${RCLONE_VERSION}"
+        println "Preparing to build rclone fork: ${RCLONE_FORK_MODULE} @ v${RCLONE_VERSION}"
 
         // 2. Add REPLACE directive
-        // This maps the requested 'github.com/rclone/rclone' to the 'filen' fork URL.
+        // FIX: Added 'v' before ${RCLONE_VERSION} because gradle.properties doesn't have it
         exec {
+            workingDir CACHE_PATH
             environment 'GOPATH', GOPATH
             commandLine 'go', 'mod', 'edit', '-replace', "github.com/rclone/rclone=${RCLONE_FORK_MODULE}@v${RCLONE_VERSION}"
         }
 
         // 3. Get the module
-        // We ask for the OFFICIAL name, but Go will download the FORK because of the replace rule above.
+        // We ask for strict rclone, but get the fork due to replacement
         exec {
+            workingDir CACHE_PATH
             environment 'GOPATH', GOPATH
-            commandLine 'go', 'get', '-v', "${RCLONE_MODULE}" // -d is deprecated, removed
+            commandLine 'go', 'get', '-v', "${RCLONE_MODULE}" 
         }
 
         // 4. Tidy dependencies
-        // Ensures go.sum is correct and prevents missing module errors.
         exec {
+            workingDir CACHE_PATH
             environment 'GOPATH', GOPATH
             commandLine 'go', 'mod', 'tidy'
         }
@@ -252,6 +236,7 @@ task buildAll {
 task clean {
     doLast {
         exec {
+            workingDir CACHE_PATH
             environment 'GOPATH', GOPATH
             commandLine 'go', 'clean', '-cache', '-testcache', '-modcache', '-fuzzcache'
         }
