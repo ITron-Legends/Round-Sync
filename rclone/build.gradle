@@ -17,9 +17,7 @@
 //  - go 1.20+
 //  - Either Android SDK command-line tools, or the expected NDK version (see gradle.properties).
 
-
 import groovy.json.JsonSlurper
-
 import java.nio.file.Paths
 
 ext {
@@ -27,8 +25,14 @@ ext {
     NDK_TOOLCHAIN_VERSION = project.properties['de.felixnuesse.extract.ndkToolchainVersion']
     RCLONE_VERSION = project.properties['de.felixnuesse.extract.rCloneVersion']
     GO_REQ_VERSION = project.properties['de.felixnuesse.extract.goVersion']
-    RCLONE_MODULE = 'github.com/FilenCloudDienste/filen-rclone'     // <-- CHANGED
-    RCLONE_CUSTOM_VERSION_SUFFIX = '-filen'                         // <-- CHANGED
+    
+    // FIXED: We must use the official module name because the source code inside 
+    // the Filen fork still claims to be "github.com/rclone/rclone".
+    RCLONE_MODULE = 'github.com/rclone/rclone'     
+    
+    // We define the fork URL separately to use in the 'replace' directive.
+    RCLONE_FORK_MODULE = 'github.com/FilenCloudDienste/filen-rclone'
+    RCLONE_CUSTOM_VERSION_SUFFIX = '-filen'
 
     PROJECT_DIR = projectDir.absolutePath
     CACHE_PATH = Paths.get(PROJECT_DIR, 'cache').toString()
@@ -100,9 +104,6 @@ def getCrossCompiler(abi) {
     } else if (osName.startsWith('Linux') && osArch == 'amd64') {
         os = 'linux-x86_64'
     } else if (osName.startsWith('Mac') && ['aarch64', 'amd64'].contains(osArch)) {
-        // Note that despite what the name suggests, the clang binary shipped
-        // with the NDK is a universal object file which should work on both
-        // x86_64 and arm64 (Silicon-based) architectures.
         os = 'darwin-x86_64'
     }
     if (os == null) {
@@ -151,7 +152,10 @@ def buildRclone(abi) {
                 environment 'CGO_LDFLAGS', '-fuse-ld=lld -Wl,--hash-style=both -s'
                 abiToEnv[abi].each {entry -> environment entry.key, entry.value}
                 workingDir CACHE_PATH
-                def ldflags = "-buildid= -X github.com/FilenCloudDienste/filen-rclone/fs.Version=${RCLONE_VERSION}${RCLONE_CUSTOM_VERSION_SUFFIX}"
+                
+                // We use RCLONE_MODULE here (rclone/rclone) because that is what the source code expects.
+                def ldflags = "-buildid= -X ${RCLONE_MODULE}/fs.Version=${RCLONE_VERSION}${RCLONE_CUSTOM_VERSION_SUFFIX}"
+                
                 commandLine (
                     'go',
                     'build',
@@ -170,8 +174,7 @@ def buildRclone(abi) {
 }
 
 task createRcloneModule(type: Exec) {
-    // We create a dummy go module to be able to checkout our specific rclone
-    // version later on.
+    // We create a dummy go module to be able to checkout our specific rclone version later on.
     onlyIf { !Paths.get(CACHE_PATH, 'go.mod').toFile().exists() }
     Paths.get(CACHE_PATH).toFile().mkdirs()
     workingDir CACHE_PATH
@@ -179,25 +182,51 @@ task createRcloneModule(type: Exec) {
     commandLine 'go', 'mod', 'init', 'rclone'
 }
 
-task checkoutRclone(type: Exec, dependsOn: createRcloneModule) {
-    workingDir CACHE_PATH
-    environment 'GOPATH', GOPATH
+// CHANGED: This task is no longer type: Exec, but a general task so we can run multiple commands.
+task checkoutRclone {
+    dependsOn createRcloneModule
+    
+    doLast {
+        workingDir CACHE_PATH
+        
+        // 1. Check Go Version
+        def goVersionOutput = new ByteArrayOutputStream()
+        exec {
+            environment 'GOPATH', GOPATH
+            commandLine 'go', 'version'
+            standardOutput = goVersionOutput
+        }
 
-    def goVersionOutput = new ByteArrayOutputStream()
-    exec{
-        commandLine 'go', 'version'
-        standardOutput = goVersionOutput;
+        if (goVersionOutput.toString().contains(GO_REQ_VERSION)) {
+            println "You are running the required go version."
+        } else {
+            logger.error("The required go version is: ${GO_REQ_VERSION}")
+            logger.error("You are running: ${goVersionOutput}")
+        }
+        
+        println "Preparing to build rclone fork: ${RCLONE_FORK_MODULE} @ ${RCLONE_VERSION}"
+
+        // 2. Add REPLACE directive
+        // This maps the requested 'github.com/rclone/rclone' to the 'filen' fork URL.
+        exec {
+            environment 'GOPATH', GOPATH
+            commandLine 'go', 'mod', 'edit', '-replace', "github.com/rclone/rclone=${RCLONE_FORK_MODULE}@v${RCLONE_VERSION}"
+        }
+
+        // 3. Get the module
+        // We ask for the OFFICIAL name, but Go will download the FORK because of the replace rule above.
+        exec {
+            environment 'GOPATH', GOPATH
+            commandLine 'go', 'get', '-v', "${RCLONE_MODULE}" // -d is deprecated, removed
+        }
+
+        // 4. Tidy dependencies
+        // Ensures go.sum is correct and prevents missing module errors.
+        exec {
+            environment 'GOPATH', GOPATH
+            commandLine 'go', 'mod', 'tidy'
+        }
     }
-
-    if (goVersionOutput.toString().contains(GO_REQ_VERSION)) {
-        println "You are running the required go version."
-    } else {
-        logger.error("The requred go version is: ${GO_REQ_VERSION}")
-        logger.error( "You are running: ${goVersionOutput}")
-    }
-    println "You are building rclone v${RCLONE_VERSION}"
-
-    commandLine 'go', 'get', '-v', '-d', "${RCLONE_MODULE}@v${RCLONE_VERSION}"
 }
 
 task buildArm(dependsOn: checkoutRclone) {
